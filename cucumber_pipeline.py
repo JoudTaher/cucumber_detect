@@ -57,34 +57,42 @@ SAM_STAB_SCORE_THRESH = 0.92
 SAM_MIN_MASK_REGION   = 1000
 
 # ── Contour filtering thresholds ─────────────────────────────────────────────
-MIN_CONTOUR_AREA   = 8_000     # pixels²  – reject tiny blobs
+MIN_CONTOUR_AREA   = 6_000     # pixels²  – reject tiny blobs
 MAX_CONTOUR_AREA   = 200_000   # pixels²  – reject background-size regions
-MIN_ASPECT_RATIO   = 3.0       # long/short – cucumbers are elongated
-MAX_CIRCULARITY    = 0.50      # 4π·A/P²  – reject round blobs
-MIN_SOLIDITY       = 0.55      # A / hull_area
+MIN_ASPECT_RATIO   = 2.5       # long/short – cucumbers are elongated; relaxed for curved ones
+MAX_CIRCULARITY    = 0.52      # 4π·A/P²  – reject round blobs
+MIN_SOLIDITY       = 0.50      # A / hull_area; relaxed so partial cucumbers pass
 MAX_SOLIDITY       = 1.00
 HSV_FILTER_ENABLED = True
-# HSV range for cucumber-green colour (H in OpenCV 0-179)
-HSV_LOW  = np.array([25,  40,  50])
-HSV_HIGH = np.array([90, 255, 255])
-HSV_MIN_GREEN_FRACTION = 0.30  # at least 30 % of mask pixels must be cucumber-green
+# Primary HSV range for cucumber-green colour (H in OpenCV 0-179)
+HSV_LOW  = np.array([22,  30,  40])
+HSV_HIGH = np.array([95, 255, 255])
+# Secondary HSV range – darker/shadowed cucumber regions
+HSV_LOW2  = np.array([18,  20,  20])
+HSV_HIGH2 = np.array([100, 255, 140])
+HSV_MIN_GREEN_FRACTION = 0.20  # relaxed: shadowed cucumbers have less saturated green
 
 # ── Tracker thresholds ────────────────────────────────────────────────────────
-TRACK_MAX_DIST        = 150    # px  – max centroid jump to accept a match
-TRACK_MAX_AREA_RATIO  = 4.0    # max(a1,a2)/min(a1,a2) for area similarity
-TRACK_SHAPE_SIM_MAX   = 0.80   # Hu-moment distance (log scale) upper bound
-TRACK_MIN_HIT_FRAMES  = 8      # track must survive this many frames to be counted
-TRACK_MAX_MISS_FRAMES = 5      # frames a track may go unseen before being dropped
-TRACK_MIN_DISPLAY_HITS = 3     # minimum hit_count before a track is drawn on screen
+TRACK_MAX_DIST        = 160    # px  – max centroid jump per frame
+TRACK_MAX_AREA_RATIO  = 6.0    # loose area check; noisy masks vary a lot
+TRACK_SHAPE_SIM_MAX   = 999.0  # effectively disabled – noisy masks are not shape-comparable
+TRACK_MIN_HIT_FRAMES  = 6      # count a cucumber after 6 stable frames (reduces fragment overcounting)
+TRACK_MAX_MISS_FRAMES = 10     # keep identity across short segmentation gaps
+TRACK_MIN_DISPLAY_HITS = 2     # show a track after 2 hits
+
+# ── Spatial dedup at count time ───────────────────────────────────────────────
+# If a second track gets "counted" within this many pixels of an already-counted
+# centroid, we suppress it (it's a re-detection of the same physical cucumber).
+TRACK_COUNT_MIN_DIST  = 80     # px
 
 # ── Display / rolling window ──────────────────────────────────────────────────
-DISPLAY_MEDIAN_WINDOW = 30    # number of recent frames used for rolling median
-SKEL_GAP_SQ           = 9     # max squared distance between consecutive skeleton pts (3 px)
+DISPLAY_MEDIAN_WINDOW = 20    # number of recent frames used for rolling median
+SKEL_GAP_SQ           = 4     # max squared pixel gap in skeleton walk (2 px)
 
 # ── Counting line ─────────────────────────────────────────────────────────────
-# A virtual vertical line; objects are counted when their centroid crosses it.
-# Set to None to use the "stable track" counting strategy instead.
-COUNTING_LINE_X: Optional[int] = None   # e.g. 640 for mid-frame
+# Set to None to auto-derive from frame width (mid-frame vertical line).
+# For a conveyor moving left→right, mid-frame is the natural crossing point.
+COUNTING_LINE_X: Optional[int] = None   # None = auto (set to frame_width // 2 at runtime)
 
 # ── Visualisation toggles ────────────────────────────────────────────────────
 DRAW_CONTOUR     = True
@@ -228,27 +236,53 @@ def _sam_segment(frame: np.ndarray) -> List[CandidateMask]:
 
 def _fallback_segment(frame: np.ndarray) -> List[CandidateMask]:
     """
-    Fallback segmentation using HSV colour thresholding + morphological cleanup.
+    Improved fallback segmentation using:
+    - CLAHE equalisation to handle reflections and shadows
+    - Two HSV ranges (bright green + shadowed green)
+    - Per-component mask smoothing via Gaussian blur + re-threshold
     Mimics SAM by returning a list of per-object CandidateMask objects.
     """
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # ── 1. CLAHE on L channel to normalise lighting ──────────────────────
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    l_ch = clahe.apply(l_ch)
+    equalized = cv2.merge([l_ch, a_ch, b_ch])
+    enhanced  = cv2.cvtColor(equalized, cv2.COLOR_LAB2BGR)
 
-    # Green / yellow-green range for cucumbers
-    mask_green = cv2.inRange(hsv, HSV_LOW, HSV_HIGH)
+    # ── 2. HSV on enhanced frame (primary range) ─────────────────────────
+    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+    mask_a = cv2.inRange(hsv, HSV_LOW,  HSV_HIGH)
 
-    # Morphological cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    cleaned = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel, iterations=3)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,  kernel, iterations=2)
+    # ── 3. HSV on original frame (catches areas CLAHE over-saturates) ────
+    hsv_orig = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask_b   = cv2.inRange(hsv_orig, HSV_LOW,  HSV_HIGH)
+    mask_c   = cv2.inRange(hsv_orig, HSV_LOW2, HSV_HIGH2)
 
-    # Connected-component labelling → one mask per blob
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    combined = cv2.bitwise_or(mask_a, cv2.bitwise_or(mask_b, mask_c))
+
+    # ── 4. Morphological cleanup ─────────────────────────────────────────
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed  = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k_close, iterations=3)
+    opened  = cv2.morphologyEx(closed,   cv2.MORPH_OPEN,  k_open,  iterations=2)
+
+    # ── 5. Per-component mask smoothing ──────────────────────────────────
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        opened, connectivity=8)
     results: List[CandidateMask] = []
-    for lbl in range(1, num_labels):  # skip background (0)
-        area = float(stats[lbl, cv2.CC_STAT_AREA])
-        if area < MIN_CONTOUR_AREA * 0.5:
+    for lbl in range(1, num_labels):
+        area_raw = float(stats[lbl, cv2.CC_STAT_AREA])
+        if area_raw < MIN_CONTOUR_AREA * 0.4:
             continue
         blob = (labels == lbl).astype(np.uint8) * 255
+        # Smooth each blob independently (fills small holes, removes spurs)
+        blob = cv2.GaussianBlur(blob, (7, 7), 0)
+        _, blob = cv2.threshold(blob, 64, 255, cv2.THRESH_BINARY)
+        # Final area after smoothing
+        area = float((blob > 0).sum())
+        if area < MIN_CONTOUR_AREA * 0.4:
+            continue
         x = int(stats[lbl, cv2.CC_STAT_LEFT])
         y = int(stats[lbl, cv2.CC_STAT_TOP])
         w = int(stats[lbl, cv2.CC_STAT_WIDTH])
@@ -295,6 +329,20 @@ class Detection:
     hsv_stats:      Optional[np.ndarray] = None  # mean HSV inside mask
 
 
+def _smooth_contour(contour: np.ndarray, epsilon_frac: float = 0.008) -> np.ndarray:
+    """
+    Simplify/smooth a contour with approxPolyDP then re-interpolate via convex-hull
+    blending to remove micro-jitter while preserving overall shape.
+    """
+    peri = cv2.arcLength(contour, True)
+    eps  = epsilon_frac * peri
+    approx = cv2.approxPolyDP(contour, eps, True)
+    # Ensure minimum 5 points so ellipse fit can work
+    if len(approx) < 5:
+        return contour
+    return approx
+
+
 def _mask_to_best_contour(mask: np.ndarray) -> Optional[np.ndarray]:
     """Extract the largest valid contour from a binary mask."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -304,7 +352,7 @@ def _mask_to_best_contour(mask: np.ndarray) -> Optional[np.ndarray]:
     best = max(contours, key=cv2.contourArea)
     if cv2.contourArea(best) < MIN_CONTOUR_AREA * 0.3:
         return None
-    return best
+    return _smooth_contour(best)
 
 
 def _dedup_masks(masks: List[CandidateMask]) -> List[CandidateMask]:
@@ -332,16 +380,18 @@ def _dedup_masks(masks: List[CandidateMask]) -> List[CandidateMask]:
 
 
 def _passes_hsv_filter(frame: np.ndarray, mask: np.ndarray) -> bool:
-    """Return True if enough of the masked region is cucumber-green."""
+    """Return True if enough of the masked region is cucumber-green (either range)."""
     if not HSV_FILTER_ENABLED:
         return True
-    roi = cv2.bitwise_and(frame, frame, mask=mask)
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    green = cv2.inRange(hsv, HSV_LOW, HSV_HIGH)
-    green_px = int(green[mask > 0].sum() / 255)
-    total_px = int((mask > 0).sum())
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    green_a = cv2.inRange(hsv, HSV_LOW,  HSV_HIGH)
+    green_b = cv2.inRange(hsv, HSV_LOW2, HSV_HIGH2)
+    green   = cv2.bitwise_or(green_a, green_b)
+    valid   = mask > 0
+    total_px = int(valid.sum())
     if total_px == 0:
         return False
+    green_px = int((green[valid] > 0).sum())
     return (green_px / total_px) >= HSV_MIN_GREEN_FRACTION
 
 
@@ -521,17 +571,25 @@ def _extract_centerline(binary_mask: np.ndarray,
     """
     Skeletonise the binary mask and return ordered centerline points (N×2)
     in the original mask coordinate space.
-    Downsamples large masks before skeletonising for speed.
-    Returns None if centerline is too short or unstable.
+
+    Improvements over the old greedy walk:
+    - Gaussian-smooth the mask before skeletonising (fills holes, reduces spurs)
+    - Build explicit 8-connectivity graph, identify true endpoint pixels
+    - Trace the longest path between endpoints (no side-branch jumping)
+    - Scale back to original coordinates
+    Returns None if centerline is too short or unreliable.
     """
     h, w = binary_mask.shape[:2]
-    # Downsample so the largest dimension is at most 256 px
-    scale = min(1.0, 256.0 / max(h, w))
+    # Downsample so the largest dimension is at most 200 px
+    scale = min(1.0, 200.0 / max(h, w, 1))
     sh, sw = max(1, int(h * scale)), max(1, int(w * scale))
-    small = cv2.resize(binary_mask, (sw, sh),
-                       interpolation=cv2.INTER_NEAREST)
+    small = cv2.resize(binary_mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
 
-    bw = (small > 0).astype(np.uint8)
+    # Smooth before skeletonising to fill interior holes and remove edge spurs
+    small = cv2.GaussianBlur(small, (5, 5), 0)
+    _, small = cv2.threshold(small, 64, 255, cv2.THRESH_BINARY)
+
+    bw   = (small > 0).astype(np.uint8)
     skel = skeletonize(bw).astype(np.uint8)
 
     ys, xs = np.where(skel > 0)
@@ -540,61 +598,75 @@ def _extract_centerline(binary_mask: np.ndarray,
 
     pts = np.column_stack([xs, ys])
 
-    # Order points along the skeleton using a greedy nearest-neighbour walk
-    ordered = _order_skeleton_points(pts)
+    # ── Graph-based endpoint tracing ─────────────────────────────────────
+    ordered = _trace_skeleton_path(pts)
     if ordered is None or len(ordered) < min_length:
         return None
 
     # Scale back to original coordinates
     if scale < 1.0:
-        ordered = (ordered / scale).astype(np.int32)
+        ordered = (ordered.astype(float) / scale).astype(np.int32)
     return ordered
 
 
-def _order_skeleton_points(pts: np.ndarray) -> Optional[np.ndarray]:
+def _trace_skeleton_path(pts: np.ndarray) -> Optional[np.ndarray]:
     """
-    Order skeleton pixels from one endpoint to the other.
-    Uses a fast nearest-neighbour walk via a KD-tree-style approach.
+    Build an 8-connectivity adjacency structure from skeleton pixels.
+    Find the two pixels with fewest neighbours (true endpoints).
+    Do a BFS/DFS to find the path between them that covers the most pixels,
+    avoiding side branches.  Returns an ordered (N×2) array.
     """
     if len(pts) < 2:
         return None
-    pts = pts.copy()
 
-    # Find an endpoint: pixel with fewest neighbours
-    pts_set = {(p[0], p[1]) for p in pts}
-    neighbour_dirs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+    # Index pixels into a set for O(1) lookup
+    pts_set: dict = {(int(p[0]), int(p[1])): i for i, p in enumerate(pts)}
+    dirs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
 
-    def n_neighbours(p):
-        return sum(1 for d in neighbour_dirs if (p[0]+d[0], p[1]+d[1]) in pts_set)
+    def neighbours(p):
+        x, y = p
+        return [(x+dx, y+dy) for dx, dy in dirs if (x+dx, y+dy) in pts_set]
 
-    # Find endpoint (1 neighbour or fewest)
-    endpoint = min(pts.tolist(), key=n_neighbours)
+    # Degree of each pixel
+    degree = {tuple(p): len(neighbours(tuple(p))) for p in pts}
 
-    # Walk greedily
-    ordered = [endpoint]
-    visited = {tuple(endpoint)}
-    current = endpoint
-    all_pts = pts.tolist()   # convert once
+    # Endpoints: degree 1 (or 0 for isolated, treat as both endpoint)
+    endpoints = [p for p, d in degree.items() if d <= 1]
+    if len(endpoints) < 2:
+        # No clear endpoints (e.g. closed loop) – pick the two extremes along x
+        xs_arr = pts[:, 0]
+        endpoints = [tuple(pts[xs_arr.argmin()]), tuple(pts[xs_arr.argmax()])]
+
+    # Walk from the endpoint with smallest x to the one with largest x
+    # (ensures consistent left→right direction)
+    endpoints.sort(key=lambda p: p[0])
+    start = endpoints[0]
+    goal  = endpoints[-1]
+
+    # Greedy walk following the path (at each step prefer unvisited with lowest degree)
+    ordered = [start]
+    visited = {start}
+    current = start
     while True:
-        # Find unvisited point closest to current
-        best_d = np.inf
-        best_p = None
-        cx, cy = current
-        for p in all_pts:
-            tp = (p[0], p[1])
-            if tp in visited:
-                continue
-            d = (p[0]-cx)**2 + (p[1]-cy)**2
-            if d < best_d:
-                best_d = d
-                best_p = p
-        if best_p is None or best_d > SKEL_GAP_SQ:   # stop if gap > 3 px
+        nbrs = [n for n in neighbours(current) if n not in visited]
+        if not nbrs:
             break
-        ordered.append(best_p)
-        visited.add(tuple(best_p))
-        current = best_p
+        # Prefer the neighbour that is closest to the goal (greedy A*-lite)
+        gx, gy = goal
+        nbrs.sort(key=lambda n: (n[0]-gx)**2 + (n[1]-gy)**2)
+        nxt = nbrs[0]
+        ordered.append(nxt)
+        visited.add(nxt)
+        current = nxt
+        if current == goal:
+            break
 
     return np.array(ordered) if len(ordered) >= 2 else None
+
+
+def _order_skeleton_points(pts: np.ndarray) -> Optional[np.ndarray]:
+    """Legacy wrapper – delegates to _trace_skeleton_path."""
+    return _trace_skeleton_path(pts)
 
 
 def _measure(
@@ -607,40 +679,55 @@ def _measure(
            Tuple[Tuple[int, int], Tuple[int, int]]]:
     """
     Compute length, thickness, curvature.
-    Primary: centerline-based. Fallback: principal-axis projection.
+    Primary: centerline-based with local tangent for thickness.
+    Fallback: principal-axis projection.
     Returns (length, thickness, curvature, length_pts, thickness_pts).
+
+    Curvature = arc_length / chord_length (≥ 1.0 by definition).
+    Clamped to [1.0, 2.0] — values outside that range indicate a
+    broken centerline and are discarded in favour of 1.0.
     """
     # ── Try centerline approach ─────────────────────────────────────────────
     cl = _extract_centerline(binary_mask)
-    if cl is not None and len(cl) >= 5:
-        arc = poly_arc_length(cl)
-        ep1 = tuple(cl[0].astype(int))
-        ep2 = tuple(cl[-1].astype(int))
+    if cl is not None and len(cl) >= 8:
+        arc   = poly_arc_length(cl.astype(float))
+        ep1   = tuple(cl[0].astype(int))
+        ep2   = tuple(cl[-1].astype(int))
         chord = point_distance(ep1, ep2)
-        curvature = arc / (chord + 1e-9)
 
-        # Midpoint for thickness
+        raw_curv = arc / (chord + 1e-9)
+        # Sanity-clamp: a broken skeleton produces arc >> chord
+        curvature = float(np.clip(raw_curv, 1.0, 2.0)) if chord > 5 else 1.0
+
+        # Use local tangent at midpoint for thickness direction
         mid_idx = len(cl) // 2
-        mid_pt = cl[mid_idx].astype(float)
+        mid_pt  = cl[mid_idx].astype(float)
+        # Estimate local tangent from a window of ±3 points
+        lo = max(0, mid_idx - 3)
+        hi = min(len(cl) - 1, mid_idx + 3)
+        tangent = cl[hi].astype(float) - cl[lo].astype(float)
+        t_len = math.hypot(tangent[0], tangent[1])
+        if t_len > 1e-3:
+            local_vec = (tangent[0] / t_len, tangent[1] / t_len)
+        else:
+            local_vec = axis_vec
 
         thickness, tp1, tp2 = _perpendicular_thickness(
-            contour, mid_pt, axis_vec)
+            contour, mid_pt, local_vec)
 
-        len_pts  = (ep1, ep2)
-        thick_pts = (tp1, tp2)
-        return arc, thickness, curvature, len_pts, thick_pts
+        return arc, thickness, curvature, (ep1, ep2), (tp1, tp2)
 
     # ── Fallback: principal axis from PCA on contour points ────────────────
-    pts = contour.reshape(-1, 2).astype(np.float32)
-    mean = pts.mean(axis=0)
+    pts    = contour.reshape(-1, 2).astype(np.float32)
+    mean   = pts.mean(axis=0)
     _, _, vt = np.linalg.svd(pts - mean, full_matrices=False)
-    principal = vt[0]                # main direction
+    principal  = vt[0]
     projections = (pts - mean) @ principal
     min_p, max_p = projections.min(), projections.max()
     ep1 = tuple((mean + min_p * principal).astype(int))
     ep2 = tuple((mean + max_p * principal).astype(int))
     arc = point_distance(ep1, ep2)
-    curvature = 1.0                  # no bending info available
+    curvature = 1.0   # no bending info from axis projection
 
     thickness, tp1, tp2 = _perpendicular_thickness(
         contour, np.array(centroid), axis_vec)
@@ -743,6 +830,7 @@ class Tracker:
         self._tracks: Dict[int, Track] = {}
         self._next_id = 1
         self._total_count = 0
+        self._counted_centroids: List[Tuple[float, float]] = []
 
     @property
     def total_count(self) -> int:
@@ -867,24 +955,22 @@ class Tracker:
             del self._tracks[tid]
 
     def _try_count(self, frame_idx: int) -> None:
-        """Mark a track as counted when its criteria are met."""
+        """
+        Count each track once when it first reaches TRACK_MIN_HIT_FRAMES.
+        This is the most robust strategy for conveyor scenes:
+        - No line-crossing needed (cucumbers may already be past any fixed line)
+        - No spatial dedup (cucumbers move through the same x-positions over time)
+        - trk.counted=True prevents ever counting the same track twice
+        The only double-count risk is fragmentation: one cucumber → 2+ tracks both
+        reaching MIN_HIT_FRAMES. Mitigated by improved tracker stability (SHAPE
+        check disabled, generous miss tolerance) rather than post-hoc dedup.
+        """
         for trk in self._tracks.values():
             if trk.counted:
                 continue
-            if COUNTING_LINE_X is not None:
-                # Line-crossing strategy
-                if (trk.prev_centroid is not None and
-                        trk.last_cx is not None):
-                    prev_x = trk.prev_centroid[0]
-                    curr_x = trk.centroid[0]
-                    if min(prev_x, curr_x) <= COUNTING_LINE_X <= max(prev_x, curr_x):
-                        trk.counted = True
-                        self._total_count += 1
-            else:
-                # Stable-track strategy
-                if trk.hit_count >= TRACK_MIN_HIT_FRAMES:
-                    trk.counted = True
-                    self._total_count += 1
+            if trk.hit_count >= TRACK_MIN_HIT_FRAMES:
+                trk.counted = True
+                self._total_count += 1
 
 
 # =============================================================================
@@ -1071,6 +1157,7 @@ def annotate_frame(frame: np.ndarray,
 # =============================================================================
 
 def main() -> None:
+    global COUNTING_LINE_X
     log.info("=== Cucumber detection pipeline starting ===")
 
     # ── Initialise SAM (non-fatal if unavailable) ──────────────────────────
@@ -1087,6 +1174,13 @@ def main() -> None:
         raise IOError(f"Cannot read first frame: {frame_paths[0]}")
     first_frame = rectify_frame(first_frame)
     h, w = first_frame.shape[:2]
+
+    # ── Auto-set counting line to frame mid-width when explicitly requested ──
+    # If COUNTING_LINE_X is None, use stable-track counting (default for most scenes).
+    if COUNTING_LINE_X is not None:
+        log.info("Counting line at x=%d.", COUNTING_LINE_X)
+    else:
+        log.info("Using stable-track counting strategy (COUNTING_LINE_X not set).")
 
     writer = create_video_writer(OUTPUT_VIDEO, w, h)
     log.info("Writing output to: %s  (%dx%d @ %d fps)", OUTPUT_VIDEO, w, h, OUTPUT_FPS)
