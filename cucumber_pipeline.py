@@ -57,17 +57,17 @@ SAM_STAB_SCORE_THRESH = 0.92
 SAM_MIN_MASK_REGION   = 1000
 
 # ── Contour filtering thresholds ─────────────────────────────────────────────
-MIN_CONTOUR_AREA   = 2_000     # pixels²  – reject tiny blobs
+MIN_CONTOUR_AREA   = 8_000     # pixels²  – reject tiny blobs
 MAX_CONTOUR_AREA   = 200_000   # pixels²  – reject background-size regions
-MIN_ASPECT_RATIO   = 2.5       # long/short – cucumbers are elongated
-MAX_CIRCULARITY    = 0.55      # 4π·A/P²  – reject round blobs
-MIN_SOLIDITY       = 0.60      # A / hull_area
+MIN_ASPECT_RATIO   = 3.0       # long/short – cucumbers are elongated
+MAX_CIRCULARITY    = 0.50      # 4π·A/P²  – reject round blobs
+MIN_SOLIDITY       = 0.55      # A / hull_area
 MAX_SOLIDITY       = 1.00
 HSV_FILTER_ENABLED = True
 # HSV range for cucumber-green colour (H in OpenCV 0-179)
-HSV_LOW  = np.array([25,  30,  40])
-HSV_HIGH = np.array([95, 255, 255])
-HSV_MIN_GREEN_FRACTION = 0.25  # at least 25 % of mask pixels must be cucumber-green
+HSV_LOW  = np.array([25,  40,  50])
+HSV_HIGH = np.array([90, 255, 255])
+HSV_MIN_GREEN_FRACTION = 0.30  # at least 30 % of mask pixels must be cucumber-green
 
 # ── Tracker thresholds ────────────────────────────────────────────────────────
 TRACK_MAX_DIST        = 150    # px  – max centroid jump to accept a match
@@ -75,6 +75,7 @@ TRACK_MAX_AREA_RATIO  = 4.0    # max(a1,a2)/min(a1,a2) for area similarity
 TRACK_SHAPE_SIM_MAX   = 0.80   # Hu-moment distance (log scale) upper bound
 TRACK_MIN_HIT_FRAMES  = 8      # track must survive this many frames to be counted
 TRACK_MAX_MISS_FRAMES = 5      # frames a track may go unseen before being dropped
+TRACK_MIN_DISPLAY_HITS = 3     # minimum hit_count before a track is drawn on screen
 
 # ── Display / rolling window ──────────────────────────────────────────────────
 DISPLAY_MEDIAN_WINDOW = 30    # number of recent frames used for rolling median
@@ -86,15 +87,22 @@ SKEL_GAP_SQ           = 9     # max squared distance between consecutive skeleto
 COUNTING_LINE_X: Optional[int] = None   # e.g. 640 for mid-frame
 
 # ── Visualisation toggles ────────────────────────────────────────────────────
-DRAW_CONTOUR    = True
-DRAW_FILL       = True        # semi-transparent mask fill
-DRAW_CENTROID   = True
-DRAW_AXIS       = True
-DRAW_LENGTH     = True
-DRAW_THICKNESS  = True
-DRAW_CURVATURE  = True
-DRAW_TRACK_TRAIL = True
-DRAW_COUNT      = True
+DRAW_CONTOUR     = True
+DRAW_FILL        = True         # semi-transparent mask fill
+DRAW_CENTROID    = True
+DRAW_AXIS        = True
+DRAW_LENGTH      = True
+DRAW_THICKNESS   = True
+DRAW_CURVATURE   = True
+DRAW_TRACK_TRAIL = False        # disabled – reduces visual clutter
+DRAW_COUNT       = True
+
+# ── Label appearance ──────────────────────────────────────────────────────────
+LABEL_FONT_SCALE  = 0.52        # text size
+LABEL_FONT_THICK  = 1           # text stroke thickness
+LABEL_LINE_HEIGHT = 18          # pixels between label lines
+LABEL_PAD         = 4           # padding inside background box
+LABEL_BG_ALPHA    = 0.65        # opacity of the dark background box (0–1)
 
 
 # =============================================================================
@@ -318,7 +326,7 @@ def _dedup_masks(masks: List[CandidateMask]) -> List[CandidateMask]:
             inter = np.logical_and(masks[i].binary, masks[j].binary).sum()
             union = np.logical_or(masks[i].binary, masks[j].binary).sum()
             iou = inter / (union + 1e-9)
-            if iou > 0.5:
+            if iou > 0.35:          # more aggressive deduplication
                 used[j] = True
     return keep
 
@@ -398,7 +406,29 @@ def extract_and_filter_contours(
         if det is not None:
             detections.append(det)
 
+    # ── Second-pass dedup: drop any detection whose centroid is too close
+    #    to a larger already-accepted detection (catches masks the IoU pass misses).
+    detections = _dedup_detections_by_centroid(detections)
     return detections
+
+
+def _dedup_detections_by_centroid(
+        detections: List["Detection"],
+        min_dist: int = 60) -> List["Detection"]:
+    """Keep at most one detection per spatial cluster (nearest-centroid)."""
+    if len(detections) <= 1:
+        return detections
+    # Sort largest area first so the best representative wins
+    dets = sorted(detections, key=lambda d: -d.area)
+    kept: List["Detection"] = []
+    for det in dets:
+        too_close = any(
+            point_distance(det.centroid, k.centroid) < min_dist
+            for k in kept
+        )
+        if not too_close:
+            kept.append(det)
+    return kept
 
 
 def _build_detection(
@@ -862,8 +892,14 @@ class Tracker:
 # =============================================================================
 
 COLOURS = [
-    (0, 255, 0),   (0, 200, 255), (255, 128, 0), (200, 0, 255),
-    (255, 255, 0), (0, 128, 255), (128, 255, 0), (255, 0, 128),
+    (0, 230, 0),    # bright green
+    (0, 190, 255),  # sky blue
+    (255, 110, 0),  # orange
+    (200, 0, 255),  # purple
+    (0, 255, 200),  # cyan-green
+    (255, 220, 0),  # yellow
+    (180, 255, 0),  # lime
+    (255, 0, 140),  # hot pink
 ]
 
 
@@ -871,83 +907,161 @@ def _track_colour(track_id: int) -> Tuple[int, int, int]:
     return COLOURS[track_id % len(COLOURS)]
 
 
+def _draw_label_box(img: np.ndarray,
+                    lines: List[str],
+                    anchor: Tuple[int, int],
+                    colour: Tuple[int, int, int],
+                    frame_w: int, frame_h: int) -> None:
+    """
+    Draw a dark-background label block at *anchor* (top-left of box),
+    clamped to stay inside the frame.
+    """
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    scale      = LABEL_FONT_SCALE
+    thick      = LABEL_FONT_THICK
+    pad        = LABEL_PAD
+    line_h     = LABEL_LINE_HEIGHT
+
+    # Measure total box size
+    max_w = max(cv2.getTextSize(l, font, scale, thick)[0][0] for l in lines)
+    box_w = max_w + 2 * pad
+    box_h = line_h * len(lines) + 2 * pad
+
+    # Clamp anchor so box stays on screen
+    ax = max(0, min(anchor[0], frame_w - box_w - 1))
+    ay = max(0, min(anchor[1], frame_h - box_h - 1))
+
+    # Dark background with alpha blend
+    overlay = img.copy()
+    cv2.rectangle(overlay, (ax, ay), (ax + box_w, ay + box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, LABEL_BG_ALPHA, img, 1 - LABEL_BG_ALPHA, 0, img)
+
+    # Text lines
+    for k, txt in enumerate(lines):
+        ty = ay + pad + (k + 1) * line_h - 3
+        cv2.putText(img, txt, (ax + pad, ty), font, scale, colour, thick + 1,
+                    cv2.LINE_AA)
+        cv2.putText(img, txt, (ax + pad, ty), font, scale, (255, 255, 255),
+                    thick, cv2.LINE_AA)
+
+
 def annotate_frame(frame: np.ndarray,
                    tracks: List[Track],
                    total_count: int) -> np.ndarray:
-    """Draw all overlays onto *frame* (in-place) and return it."""
+    """Draw all overlays onto *frame* and return the annotated copy."""
     out = frame.copy()
+    frame_h, frame_w = out.shape[:2]
 
-    for trk in tracks:
-        det = trk.current_detection
-        if det is None:
-            continue
-        colour = _track_colour(trk.track_id)
+    # Only draw tracks that have been seen enough times (confirmed tracks)
+    visible = [t for t in tracks
+               if t.current_detection is not None
+               and t.hit_count >= TRACK_MIN_DISPLAY_HITS]
 
-        # ── Contour & fill ─────────────────────────────────────────────────
-        if DRAW_FILL:
-            overlay = out.copy()
+    # ── Per-track drawing ──────────────────────────────────────────────────
+    # First pass: fills (semi-transparent) so outlines render on top
+    if DRAW_FILL:
+        overlay = out.copy()
+        for trk in visible:
+            det = trk.current_detection
+            colour = _track_colour(trk.track_id)
             cv2.drawContours(overlay, [det.contour], -1, colour, -1)
-            out = cv2.addWeighted(overlay, 0.25, out, 0.75, 0)
+        cv2.addWeighted(overlay, 0.20, out, 0.80, 0, out)
 
+    # Second pass: outlines, lines, centroids
+    for trk in visible:
+        det    = trk.current_detection
+        colour = _track_colour(trk.track_id)
+        cx, cy = int(det.centroid[0]), int(det.centroid[1])
+
+        # Contour & hull
         if DRAW_CONTOUR:
             cv2.drawContours(out, [det.contour], -1, colour, 2)
-            cv2.drawContours(out, [det.hull],    -1, (200, 200, 200), 1)
+            cv2.drawContours(out, [det.hull], -1,
+                             tuple(max(0, c - 60) for c in colour), 1)
 
-        # ── Centroid ───────────────────────────────────────────────────────
-        cx, cy = int(det.centroid[0]), int(det.centroid[1])
+        # Centroid
         if DRAW_CENTROID:
-            cv2.circle(out, (cx, cy), 5, colour, -1)
+            cv2.circle(out, (cx, cy), 6, (255, 255, 255), -1)
+            cv2.circle(out, (cx, cy), 6, colour, 2)
 
-        # ── Track trail ────────────────────────────────────────────────────
+        # Track trail (optional, off by default)
         if DRAW_TRACK_TRAIL and len(trk.centroid_hist) >= 2:
-            trail = trk.centroid_hist[-20:]
+            trail = trk.centroid_hist[-15:]
             for k in range(1, len(trail)):
                 p1 = (int(trail[k-1][0]), int(trail[k-1][1]))
                 p2 = (int(trail[k][0]),   int(trail[k][1]))
-                cv2.line(out, p1, p2, colour, 1)
+                cv2.line(out, p1, p2, colour, 1, cv2.LINE_AA)
 
-        # ── Length line ────────────────────────────────────────────────────
+        # Length line (cyan)
         if DRAW_LENGTH and det.length_pts:
-            cv2.line(out, det.length_pts[0], det.length_pts[1], (0, 255, 255), 2)
-            cv2.circle(out, det.length_pts[0], 4, (0, 255, 255), -1)
-            cv2.circle(out, det.length_pts[1], 4, (0, 255, 255), -1)
+            lp0, lp1 = det.length_pts
+            cv2.line(out, lp0, lp1, (0, 230, 230), 2, cv2.LINE_AA)
+            cv2.circle(out, lp0, 5, (0, 230, 230), -1)
+            cv2.circle(out, lp1, 5, (0, 230, 230), -1)
 
-        # ── Thickness line ─────────────────────────────────────────────────
+        # Thickness line (orange)
         if DRAW_THICKNESS and det.thickness_pts:
-            cv2.line(out, det.thickness_pts[0], det.thickness_pts[1],
-                     (255, 165, 0), 2)
-            cv2.circle(out, det.thickness_pts[0], 4, (255, 165, 0), -1)
-            cv2.circle(out, det.thickness_pts[1], 4, (255, 165, 0), -1)
+            tp0, tp1 = det.thickness_pts
+            cv2.line(out, tp0, tp1, (0, 130, 255), 2, cv2.LINE_AA)
+            cv2.circle(out, tp0, 5, (0, 130, 255), -1)
+            cv2.circle(out, tp1, 5, (0, 130, 255), -1)
 
-        # ── Text labels ────────────────────────────────────────────────────
-        label_lines = [
+    # Counting line
+    if COUNTING_LINE_X is not None:
+        cv2.line(out, (COUNTING_LINE_X, 0), (COUNTING_LINE_X, frame_h),
+                 (0, 0, 230), 2)
+
+    # ── Third pass: labels (drawn last so they sit on top of everything) ──
+    # Collect preferred anchor positions and resolve collisions
+    label_regions: List[Tuple[int, int, int, int]] = []   # x, y, w, h
+
+    for trk in visible:
+        det    = trk.current_detection
+        colour = _track_colour(trk.track_id)
+        cx, cy = int(det.centroid[0]), int(det.centroid[1])
+
+        lines = [
             f"ID:{trk.track_id}",
             f"L:{trk.display_length:.0f}px",
             f"W:{trk.display_thickness:.0f}px",
+            f"C:{trk.display_curvature:.2f}",
         ]
-        if DRAW_CURVATURE:
-            label_lines.append(f"C:{trk.display_curvature:.2f}")
 
-        lx, ly = cx + 8, cy - 10
-        for k, txt in enumerate(label_lines):
-            ty = ly + k * 16
-            cv2.putText(out, txt, (lx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3)
-            cv2.putText(out, txt, (lx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1)
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        max_w = max(cv2.getTextSize(l, font, LABEL_FONT_SCALE,
+                                    LABEL_FONT_THICK)[0][0] for l in lines)
+        box_w = max_w + 2 * LABEL_PAD
+        box_h = LABEL_LINE_HEIGHT * len(lines) + 2 * LABEL_PAD
 
-    # ── Counting line ──────────────────────────────────────────────────────
-    if COUNTING_LINE_X is not None:
-        h = out.shape[0]
-        cv2.line(out, (COUNTING_LINE_X, 0), (COUNTING_LINE_X, h), (0, 0, 255), 2)
+        # Preferred position: just to the right of the centroid, vertically centred
+        ax = cx + 10
+        ay = cy - box_h // 2
 
-    # ── Total count ────────────────────────────────────────────────────────
+        # Clamp to frame
+        ax = max(0, min(ax, frame_w - box_w - 1))
+        ay = max(0, min(ay, frame_h - box_h - 1))
+
+        # Push down to avoid overlap with already-placed boxes
+        for (rx, ry, rw, rh) in label_regions:
+            if ax < rx + rw and ax + box_w > rx:        # horizontal overlap
+                if ay < ry + rh and ay + box_h > ry:    # vertical overlap
+                    ay = ry + rh + 2                     # shift below
+
+        # Re-clamp after push
+        ay = max(0, min(ay, frame_h - box_h - 1))
+
+        label_regions.append((ax, ay, box_w, box_h))
+        _draw_label_box(out, lines, (ax, ay), colour, frame_w, frame_h)
+
+    # ── Total cucumber count (top-left corner) ────────────────────────────
     if DRAW_COUNT:
-        txt = f"Total cucumbers: {total_count}"
-        cv2.putText(out, txt, (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
-        cv2.putText(out, txt, (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        count_txt = f"Cucumbers counted: {total_count}"
+        (tw, th), _ = cv2.getTextSize(count_txt, cv2.FONT_HERSHEY_SIMPLEX,
+                                       1.0, 2)
+        # Dark background for the count banner
+        cv2.rectangle(out, (0, 0), (tw + 16, th + 20), (0, 0, 0), -1)
+        cv2.putText(out, count_txt, (8, th + 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 0), 2, cv2.LINE_AA)
 
     return out
 

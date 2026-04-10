@@ -1,0 +1,7 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Output video (large binary – regenerate by running the pipeline)
+cucumber_output.avi
