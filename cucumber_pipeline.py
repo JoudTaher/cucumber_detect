@@ -51,10 +51,24 @@ WAITKEY_MS     = 50          # ms to pause between displayed frames
 ROTATION_ANGLE = 0
 
 # ── SAM settings (used only if SAM is available) ──────────────────────────────
-SAM_POINTS_PER_SIDE   = 32
-SAM_PRED_IOU_THRESH   = 0.86
-SAM_STAB_SCORE_THRESH = 0.92
-SAM_MIN_MASK_REGION   = 1000
+# points_per_side: 16=fast/sparse, 24=balanced, 32+=thorough; 24 is a good start
+# for conveyor scenes where cucumbers are mid-sized objects.
+SAM_POINTS_PER_SIDE            = 24
+# pred_iou_thresh: SAM's own mask quality estimate; raise to 0.90-0.92 for
+# cleaner output, lower toward 0.86 if cucumbers are being missed.
+SAM_PRED_IOU_THRESH            = 0.90
+# stability_score_thresh: 0.95 rejects unstable/flickering mask proposals.
+SAM_STAB_SCORE_THRESH          = 0.95
+# min_mask_region_area: removes tiny post-NMS fragments; 4000 px² filters
+# conveyor-belt noise while keeping full cucumber bodies.
+SAM_MIN_MASK_REGION            = 4_000
+# crop_n_layers / crop_n_points_downscale_factor: SAM runs extra image crops
+# so objects near frame edges are recovered; 1 extra layer is usually enough.
+SAM_CROP_N_LAYERS              = 1
+SAM_CROP_N_PTS_DOWNSCALE       = 2
+# box_nms_thresh: suppress duplicate overlapping masks inside SAM before our
+# own dedup pass; 0.6 is the recommended starting value.
+SAM_BOX_NMS_THRESH             = 0.6
 
 # ── Contour filtering thresholds ─────────────────────────────────────────────
 MIN_CONTOUR_AREA   = 6_000     # pixels²  – reject tiny blobs
@@ -208,6 +222,9 @@ def _try_init_sam() -> bool:
             points_per_side=SAM_POINTS_PER_SIDE,
             pred_iou_thresh=SAM_PRED_IOU_THRESH,
             stability_score_thresh=SAM_STAB_SCORE_THRESH,
+            crop_n_layers=SAM_CROP_N_LAYERS,
+            crop_n_points_downscale_factor=SAM_CROP_N_PTS_DOWNSCALE,
+            box_nms_thresh=SAM_BOX_NMS_THRESH,
             min_mask_region_area=SAM_MIN_MASK_REGION,
         )
         _SAM_AVAILABLE = True
