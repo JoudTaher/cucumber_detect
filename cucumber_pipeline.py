@@ -65,8 +65,11 @@ MIN_SOLIDITY       = 0.50      # A / hull_area; relaxed so partial cucumbers pas
 MAX_SOLIDITY       = 1.00
 HSV_FILTER_ENABLED = True
 # Primary HSV range for cucumber-green colour (H in OpenCV 0-179)
-HSV_LOW  = np.array([22,  30,  40])
-HSV_HIGH = np.array([95, 255, 255])
+HSV_PRIMARY_LOW  = np.array([22,  30,  40])
+HSV_PRIMARY_HIGH = np.array([95, 255, 255])
+# Retain short aliases so the rest of the code compiles unchanged
+HSV_LOW  = HSV_PRIMARY_LOW
+HSV_HIGH = HSV_PRIMARY_HIGH
 # Secondary HSV range – darker/shadowed cucumber regions
 HSV_LOW2  = np.array([18,  20,  20])
 HSV_HIGH2 = np.array([100, 255, 140])
@@ -80,14 +83,16 @@ TRACK_MIN_HIT_FRAMES  = 6      # count a cucumber after 6 stable frames (reduces
 TRACK_MAX_MISS_FRAMES = 10     # keep identity across short segmentation gaps
 TRACK_MIN_DISPLAY_HITS = 2     # show a track after 2 hits
 
-# ── Spatial dedup at count time ───────────────────────────────────────────────
+# ── Spatial dedup at count time (used only for stable-track mode) ─────────────
 # If a second track gets "counted" within this many pixels of an already-counted
 # centroid, we suppress it (it's a re-detection of the same physical cucumber).
-TRACK_COUNT_MIN_DIST  = 80     # px
+# NOTE: for conveyor scenes COUNTING_LINE_X should be None (stable-track mode)
+# since cucumbers move through all x-positions and line-crossing spatial dedup
+# would incorrectly block new cucumbers at the same position as old ones.
+TRACK_COUNT_MIN_DIST  = 80     # px; must be < distance between adjacent cucumbers
 
 # ── Display / rolling window ──────────────────────────────────────────────────
 DISPLAY_MEDIAN_WINDOW = 20    # number of recent frames used for rolling median
-SKEL_GAP_SQ           = 4     # max squared pixel gap in skeleton walk (2 px)
 
 # ── Counting line ─────────────────────────────────────────────────────────────
 # Set to None to auto-derive from frame width (mid-frame vertical line).
@@ -374,7 +379,7 @@ def _dedup_masks(masks: List[CandidateMask]) -> List[CandidateMask]:
             inter = np.logical_and(masks[i].binary, masks[j].binary).sum()
             union = np.logical_or(masks[i].binary, masks[j].binary).sum()
             iou = inter / (union + 1e-9)
-            if iou > 0.35:          # more aggressive deduplication
+            if iou > 0.35:          # lower than 0.5 default to catch near-duplicate masks
                 used[j] = True
     return keep
 
